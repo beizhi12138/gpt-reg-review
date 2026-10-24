@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from . import db, export_formats, registrar  # noqa: E402
+from account_transfer import MAX_BYTES as TRANSFER_MAX_BYTES  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
 from .environment import EnvironmentAllocationError  # noqa: E402
 from .exporter import _decode_jwt_payload, _get_auth  # noqa: E402
@@ -1178,6 +1179,8 @@ class ExportRegisteredReq(BaseModel):
     format: str = Field(..., description="格式 id，见 GET /api/registered/export/formats")
     emails: Optional[list[str]] = Field(None, description="要导出的 email 列表")
     all: bool = Field(False, description="true = 导出全部（跨页），忽略 emails")
+    prepare_cleanup: bool = Field(False, description="互转专用：备份精确名单，下载后再清理")
+    download_from_backup: bool = Field(False, description="互转专用：返回备份下载地址，省去 Base64 大响应")
 
 
 @app.post("/api/registered/export")
@@ -1186,7 +1189,29 @@ def api_export_registered(req: ExportRegisteredReq):
     if fmt is None:
         raise HTTPException(400, f"未知导出格式: {req.format}")
 
-    if req.all:
+    cleanup = {}
+    if req.download_from_backup and (fmt.id != "account_transfer" or not req.prepare_cleanup):
+        raise HTTPException(400, "备份下载仅支持已准备清理的账号互转导出")
+    if req.prepare_cleanup and fmt.id != "account_transfer":
+        raise HTTPException(400, "只有账号互转格式支持自动清理")
+    if fmt.id == "account_transfer":
+        from .account_transfer import export_rows, prepare_export_cleanup
+        if not req.all and not req.emails:
+            raise HTTPException(400, "需要 emails 或 all=true")
+        try:
+            if req.prepare_cleanup:
+                rows, blob, cleanup = prepare_export_cleanup(
+                    None if req.all else req.emails,
+                    include_content=not req.download_from_backup,
+                )
+            else:
+                rows = export_rows(None if req.all else req.emails)
+                blob = export_formats.render_bytes(rows, fmt)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(503, "互转备份保存失败，账号未删除，请检查磁盘空间后重试") from exc
+    elif req.all:
         rows = db.list_registered_full(limit=100000)
     elif req.emails:
         rows = db.list_registered_by_emails(req.emails)
@@ -1210,11 +1235,55 @@ def api_export_registered(req: ExportRegisteredReq):
     }
 
     if fmt.mode == "download":
+        if req.download_from_backup:
+            return {**base, **cleanup,
+                    "download_url": f"/api/registered/transfer/backups/{cleanup['export_id']}"}
         # 二进制（zip / json 文件）走 base64，前端解出来直接存盘，不弹预览
-        blob = export_formats.render_bytes(rows, fmt)
-        return {**base, "b64": base64.b64encode(blob).decode("ascii"), "size": len(blob)}
+        if fmt.id != "account_transfer":
+            blob = export_formats.render_bytes(rows, fmt)
+        return {**base, **cleanup, "b64": base64.b64encode(blob).decode("ascii"), "size": len(blob)}
 
     return {**base, "text": export_formats.render_text(rows, fmt)}
+
+
+class TransferCleanupReq(BaseModel):
+    export_id: str = Field(..., pattern=r"^[0-9a-f]{32}$")
+
+
+@app.post("/api/registered/transfer/cleanup")
+def api_transfer_cleanup(req: TransferCleanupReq):
+    from .account_transfer import cleanup_export
+    try:
+        return cleanup_export(req.export_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/registered/transfer/backups/{export_id}")
+def api_transfer_backup(export_id: str):
+    from .account_transfer import export_backup_path
+    from fastapi.responses import FileResponse
+    try:
+        path = export_backup_path(export_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return FileResponse(path, media_type="application/json", filename="gpt-account-transfer.json",
+                        headers={"Cache-Control": "no-store"})
+
+
+class TransferImportReq(BaseModel):
+    text: str = Field(..., max_length=TRANSFER_MAX_BYTES)
+    conflict: str = "skip"
+    dry_run: bool = False
+
+
+@app.post("/api/registered/transfer/import")
+def api_transfer_import(req: TransferImportReq):
+    from .account_transfer import import_document
+    try:
+        return import_document(req.text, conflict=req.conflict, dry_run=req.dry_run)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 # ──────────────────────── 邮箱来源配置 ────────────────────────

@@ -24,6 +24,8 @@ import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from account_transfer import document_bytes, make_document
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,6 +53,15 @@ def _s(row: dict, key: str) -> str:
 
 
 FORMATS: list[ExportFormat] = [
+    ExportFormat(
+        id="account_transfer",
+        label="账号互转 JSON（老系统 turb）",
+        filename="gpt-account-transfer.json",
+        mode="download",
+        mime="application/json; charset=utf-8",
+        render_all=lambda rows: document_bytes(make_document(rows, "gpt-reg-review")),
+        note="完整凭证与邮箱信息；页面导出后自动删除本系统该批账号（保留备份）",
+    ),
     ExportFormat(
         id="at",
         label="access_token",

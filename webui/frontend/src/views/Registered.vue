@@ -14,7 +14,11 @@ import { copyText, fmtTime } from '@/api/request'
 import { useFormStore, proxyText } from '@/stores/form'
 import { useProxyStore } from '@/stores/proxy'
 import { useRuntimeStore } from '@/stores/runtime'
+import { useStatsStore } from '@/stores/stats'
 import StatusDot from '@/components/StatusDot.vue'
+import AccountTransfer from '@/components/AccountTransfer.vue'
+import TransferExportStatus from '@/components/TransferExportStatus.vue'
+import { downloadAndCleanupTransfer } from '@/api/accountTransfer'
 
 const { form } = storeToRefs(useFormStore())
 // 检测用的代理必须能从代理池里挑：以前这页只在代码里读 form.proxy，页面上
@@ -43,6 +47,7 @@ const total = ref(0)
 const page = ref(1)
 const filter = ref('all')
 const selected = ref([])
+const registeredTable = ref(null)
 const loading = ref(false)
 const checkResult = ref('')
 
@@ -335,11 +340,16 @@ async function doCheckoutCapability() {
 // 格式清单来自后端 export_formats.py（账号+密码、+2FA、+AT、+取件url…），
 // 以后加格式只改后端那一个文件，前端一行都不用动。
 async function doExportSelected(fmt) {
+  if (exporting.value) return
   const emails = selected.value.map((r) => r.email)
   if (!emails.length) { ElMessage.info('请先勾选要导出的号'); return }
   exporting.value = true
   try {
     const r = await exportRegistered({ format: fmt.id, emails })
+    if (fmt.id === 'account_transfer') {
+      await finishTransferExport(r)
+      return
+    }
     exportedEmails.value = (r.emails || []).filter(Boolean)
     if (r.mode === 'download') {
       saveBlob(b64ToBytes(r.b64), r.filename, r.mime)
@@ -385,7 +395,7 @@ async function collectFilteredEmails(limit) {
   const out = []
   const pageLimit = 500
   let offset = 0
-  for (let guard = 0; guard < 40 && out.length < limit; guard += 1) {
+  while (out.length < limit && offset < 100000) {
     const { items, total } = await listRegistered({
       limit: pageLimit, offset, filter: filter.value,
     })
@@ -401,6 +411,7 @@ async function collectFilteredEmails(limit) {
 }
 
 async function doScopeExport() {
+  if (scopeBusy.value) return
   const fmt = exportFormats.value.find((f) => f.id === scopeFormatId.value)
   if (!fmt) { ElMessage.warning('请选择导出格式'); return }
   scopeBusy.value = true
@@ -417,6 +428,11 @@ async function doScopeExport() {
     if (!emails.length) { ElMessage.info('当前范围没有可导出的号'); return }
     exporting.value = true
     const r = await exportRegistered({ format: fmt.id, emails })
+    if (fmt.id === 'account_transfer') {
+      await finishTransferExport(r)
+      scopeVisible.value = false
+      return
+    }
     exportedEmails.value = (r.emails || []).filter(Boolean)
     if (r.mode === 'download') {
       saveBlob(b64ToBytes(r.b64), r.filename, r.mime)
@@ -435,6 +451,21 @@ async function doScopeExport() {
     scopeBusy.value = false
     exporting.value = false
   }
+}
+
+function transferCleaned() {
+  selected.value = []
+  exportedEmails.value = []
+  registeredTable.value?.clearSelection()
+  runtime.bumpData()
+  useStatsStore().refresh()
+  load(true)
+}
+
+async function finishTransferExport(result) {
+  const cleaned = await downloadAndCleanupTransfer(result)
+  transferCleaned()
+  ElMessage.success(`互转文件已发起下载，已清理 ${cleaned.deleted_registered} 个账号和 ${cleaned.deleted_mailboxes} 条邮箱记录`)
 }
 
 // customClass 里的 pre-line 让消息里的 \n 真的换行。
@@ -748,6 +779,7 @@ onActivated(() => load())
         <el-button @click="openScopeExport">
           <el-icon><Download /></el-icon>按筛选导出…
         </el-button>
+        <AccountTransfer :emails="selected.map(row => row.email)" @imported="load(false)" @cleaned="transferCleaned" />
         <el-divider direction="vertical" />
         <el-button type="danger" plain :disabled="!selected.length" @click="deleteSelected">
           删除选中 ({{ selected.length }})
@@ -756,9 +788,11 @@ onActivated(() => load())
         <span class="hint">{{ checkResult }}</span>
       </el-space>
 
+      <TransferExportStatus @cleaned="transferCleaned" />
       <el-skeleton v-if="loading && !rows.length" :rows="6" animated style="padding: 8px 0" />
       <el-table
         v-else
+        ref="registeredTable"
         v-loading="loading" :data="rows" size="small" stripe
         @selection-change="(v) => (selected = v)"
       >
@@ -936,10 +970,10 @@ onActivated(() => load())
             </el-select>
           </el-form-item>
         </el-form>
-        <div class="hint">导出只生成文件 / 预览，不会删除任何记录。</div>
+        <div class="hint">{{ scopeFormatId === 'account_transfer' ? '互转文件备份并发起下载后，会自动删除本系统该批账号及对应邮箱记录。' : '导出只生成文件 / 预览，不会删除任何记录。' }}</div>
         <template #footer>
           <el-button @click="scopeVisible = false">取消</el-button>
-          <el-button type="primary" :loading="scopeBusy" @click="doScopeExport">导出</el-button>
+          <el-button type="primary" :loading="scopeBusy" @click="doScopeExport">{{ scopeFormatId === 'account_transfer' ? '导出并删除' : '导出' }}</el-button>
         </template>
       </el-dialog>
 

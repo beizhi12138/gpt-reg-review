@@ -60,7 +60,10 @@ export { bulkDeleteAccounts } from './accounts'
 
 // 批量导出：格式清单由后端 export_formats.py 提供，加格式前端不用改
 export const listExportFormats = () => http.get('/api/registered/export/formats')
-export const exportRegistered = (payload) => http.post('/api/registered/export', payload)
+export const exportRegistered = (payload) => http.post('/api/registered/export', {
+  ...payload,
+  ...(payload.format === 'account_transfer' ? { prepare_cleanup: true, download_from_backup: true } : {}),
+}, { timeout: 600000 })
 
 export const checkPlus = (emails, proxy = '') =>
   http.post('/api/registered/check_plus', { emails, proxy })
