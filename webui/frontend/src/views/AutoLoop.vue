@@ -21,12 +21,16 @@ const runtime = useRuntimeStore()
 const { autoStatus } = storeToRefs(runtime)
 
 // ── 自动供号（ReMail）：池子低于阈值时自动下单买新邮箱 ──
-const supply = ref({ config: {}, available: 0, balance: '', active_orders: 0, usable_orders: 0 })
+const supply = ref({ config: { auto_buy: false }, available: 0 })
 const supplyBusy = ref(false)
+const supplyLoaded = ref(false)
+const savedAutoBuy = ref(false)
 
 async function loadSupply() {
   try {
     supply.value = await mailSupplyStatus()
+    savedAutoBuy.value = Boolean(supply.value.config?.auto_buy)
+    supplyLoaded.value = true
   } catch (_) { /* 后端没起或没配置时静默 */ }
 }
 
@@ -42,8 +46,10 @@ async function saveSupply() {
       batch_size: cfg.batch_size,
       min_available: cfg.min_available,
     })
+    savedAutoBuy.value = Boolean(supply.value.config?.auto_buy)
     ElMessage.success('自动供号配置已保存')
   } catch (e) {
+    supply.value.config.auto_buy = savedAutoBuy.value
     ElMessage.error('保存失败: ' + (e.response?.data?.detail || e.message))
   } finally { supplyBusy.value = false }
 }
@@ -52,6 +58,10 @@ async function doRefill() {
   supplyBusy.value = true
   try {
     const r = await refillMailSupply()
+    if (r.skipped) {
+      ElMessage.info(r.reason || '已跳过补货')
+      return
+    }
     ElMessage.success(`补货完成：买入 ${r.bought || 0} 个，可用 ${r.available}`)
     await loadSupply()
   } catch (e) {
@@ -206,10 +216,10 @@ async function call(fn, name) {
       <template #header>
         <span class="section-title" style="margin: 0">自动供号（ReMail）</span>
         <el-tag
-          :type="supply.config?.auto_buy ? 'success' : 'info'"
+          :type="savedAutoBuy ? 'success' : 'info'"
           size="small" style="margin-left: 8px"
         >
-          {{ supply.config?.auto_buy ? '池空自动下单已开' : '自动下单已关' }}
+          {{ !supplyLoaded ? '正在读取配置' : savedAutoBuy ? '池空自动下单已开' : '自动下单已关' }}
         </el-tag>
       </template>
 
@@ -225,7 +235,7 @@ async function call(fn, name) {
             <el-input-number v-model="supply.config.min_available" :min="0" :max="1000" />
           </el-form-item>
           <el-form-item label="自动下单">
-            <el-switch v-model="supply.config.auto_buy" />
+            <el-switch v-model="supply.config.auto_buy" :disabled="!supplyLoaded || supplyBusy" @change="saveSupply" />
           </el-form-item>
         </el-space>
 
@@ -233,21 +243,21 @@ async function call(fn, name) {
           <el-descriptions-item label="余额">{{ supply.balance ?? '-' }}</el-descriptions-item>
           <el-descriptions-item label="可用邮箱">{{ supply.available ?? 0 }}</el-descriptions-item>
           <el-descriptions-item label="已购可用订单">
-            {{ supply.usable_orders ?? 0 }} / {{ supply.active_orders ?? 0 }}
+            {{ supply.usable_orders ?? '-' }} / {{ supply.active_orders ?? '-' }}
           </el-descriptions-item>
         </el-descriptions>
 
         <el-space wrap style="margin-top: 10px">
           <el-button type="primary" :loading="supplyBusy" @click="saveSupply">保存</el-button>
           <el-button :loading="supplyBusy" @click="doImportOrders">导入已购订单（免费）</el-button>
-          <el-button type="warning" :loading="supplyBusy" @click="doRefill">
+          <el-button type="warning" :loading="supplyBusy" :disabled="!savedAutoBuy" @click="doRefill">
             立即补货（会扣余额）
           </el-button>
           <el-button @click="loadSupply">刷新</el-button>
         </el-space>
         <p class="hint" style="margin-top: 8px">
-          邮箱池低于阈值时程序会自动下单买新邮箱（{{ supply.config?.email_suffix || 'icloud.com' }}，
-          单价约 60）；买来的邮箱收件窗口只有 1 小时，会立刻投入注册，不会放着过期。
+          自动下单默认关闭，开关修改后立即保存。关闭时不自动查询订单或补货，邮箱池用完后结束任务。
+          如需导入已购邮箱，请手动点击“导入已购订单”；开启后会在低于阈值时下单并扣除余额。
         </p>
       </el-form>
     </el-card>

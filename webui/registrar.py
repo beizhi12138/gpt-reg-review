@@ -373,19 +373,64 @@ def _do_register(
     options: dict,
     log_file: Path,
 ):
-    """实际注册任务。
-
-    options:
-        want_access_token: bool
-        want_session_token: bool
-        want_refresh_token: bool
-        proxy: Optional[str]
-        otp_timeout: int
-        allow_existing_login: bool
-    """
+    """Own the worker lifecycle, including failures during setup or error handling."""
+    handler = None
+    root_logger = logging.getLogger()
+    unfinished_reason = "注册线程已退出，任务未正常收尾"
     # 先认领本线程，再挂 handler —— 顺序不能反：中间要是有日志产生，
     # 没打标记的话会被广播到其他并发 run 的日志里去。
     _current_run.run_id = run_id
+    try:
+        handler = QueueLogHandler(run_id, log_file)
+        handler.setLevel(logging.INFO)
+        root_logger.addHandler(handler)
+        if root_logger.level > logging.INFO or root_logger.level == 0:
+            root_logger.setLevel(logging.INFO)
+        _register_account(run_id, account, options, log_file)
+    except BaseException as exc:
+        # Persist only the exception type here: a setup error may contain raw credentials.
+        unfinished_reason = f"注册线程异常退出（{type(exc).__name__}），任务未正常收尾"
+        raise
+    finally:
+        try:
+            # This runs even if the normal except/finally blocks themselves fail.
+            # Only this worker's still-running row and unowned in_use mailbox may change.
+            if db.fail_unfinished_run(run_id, unfinished_reason):
+                _emit_status(run_id, "error", {
+                    "message": unfinished_reason, "category": "worker_crash",
+                })
+                ProbeSession(run_id).mark(
+                    "task.finished", "failed", error=unfinished_reason,
+                    error_category="worker_crash",
+                )
+        except Exception as exc:
+            logging.getLogger("registrar").error(
+                "[register] 任务 %s 收尾失败（%s）", run_id, type(exc).__name__,
+            )
+        finally:
+            if handler is not None:
+                root_logger.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+            q = _run_queues.get(run_id)
+            if q is not None:
+                try:
+                    q.put_nowait(None)
+                except queue.Full:
+                    pass
+            remove_run_queue(run_id)
+            _current_run.run_id = None
+
+
+def _register_account(
+    run_id: str,
+    account: dict,
+    options: dict,
+    log_file: Path,
+):
+    """Run registration and its normal success/failure handling."""
     # 流量计数按线程累计；任务开始先清零，收尾时统一写进 runs 表。
     try:
         from http_client import reset_thread_traffic
@@ -393,14 +438,6 @@ def _do_register(
         reset_thread_traffic()
     except Exception:  # noqa: BLE001
         pass
-
-    handler = QueueLogHandler(run_id, log_file)
-    handler.setLevel(logging.INFO)
-    root_logger = logging.getLogger()
-    root_logger.addHandler(handler)
-    # 第一次需要的话提到 INFO 级别
-    if root_logger.level > logging.INFO or root_logger.level == 0:
-        root_logger.setLevel(logging.INFO)
 
     email = account["email"]
     probe = ProbeSession(run_id)
@@ -1152,9 +1189,9 @@ def _do_register(
         # 仅补写密码，不覆盖已有 token，也不改变本轮失败状态。
         _result = getattr(locals().get("flow"), "result", None)
         _pw = (getattr(_result, "password", "") or "").strip()
+        _password_saved = False
         if _pw:
             _credential_email = (getattr(_result, "email", "") or email).strip().lower()
-            _password_saved = False
             try:
                 _saved = db.get_registered(_credential_email)
                 _password_saved = bool(_saved and _saved.get("password") == _pw)
@@ -1309,28 +1346,6 @@ def _do_register(
                 )
         except Exception:  # noqa: BLE001
             logging.getLogger("registrar").debug("流量计数写入失败", exc_info=True)
-        # env 覆盖现在只挂在 AuthFlow 实例上，随实例一起回收，无需还原。
-        # 关闭 handler
-        try:
-            root_logger.removeHandler(handler)
-            handler.close()
-        except Exception:
-            pass
-        q = _run_queues.get(run_id)
-        if q is not None:
-            try:
-                q.put_nowait(None)  # sentinel: 流结束
-            except queue.Full:
-                pass
-        # 队列生命周期只跟任务走：以前只有 SSE 生成器的 finally 才删，
-            # 没人订阅（或被前端断开）时队列会常驻内存，跑几百个任务后
-        # python 进程只涨不降。这里任务收尾就摘掉，SSE 已经持有引用，
-        # 仍能把剩余日志读完。
-        remove_run_queue(run_id)
-        # 线程标记清掉。理论上线程跑完就回收了，但 threading.local 是绑在
-        # 线程对象上的，万一以后换成线程池复用线程，残留的 run_id 会让下一个
-        # 任务的日志全被投递到上一个 run 的（已关闭的）文件里去。
-        _current_run.run_id = None
 
 
 def _try_export_to_panels(run_id: str, cred: dict, *, probe: Optional[ProbeSession] = None) -> None:

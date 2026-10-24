@@ -464,6 +464,8 @@ class AutoLoopController:
         except Exception as e:
             logger.exception(f"manage_loop 异常: {e}")
         finally:
+            # 自然结束也要终止后台代理体检，不能只把界面状态改成 stopped。
+            self._stop_event.set()
             with self._lock:
                 self._state = AutoLoopState.STOPPED
                 self._worker_status.clear()
@@ -525,6 +527,9 @@ class AutoLoopController:
                 try:
                     from . import mail_supply
 
+                    if not mail_supply.config()["auto_buy"]:
+                        self._set_message(f"worker-{worker_id} 号池空，自动下单已关闭，退出")
+                        return
                     supply = mail_supply.refill(reason=f"worker-{worker_id} 池空")
                     if supply.get("bought") or supply.get("imported"):
                         logger.info(f"[worker-{worker_id}] 自动补货: {supply}")
@@ -678,8 +683,8 @@ class AutoLoopController:
                 st = row["status"]
                 if st == "done":
                     return True, ""
-                if st == "failed":
-                    return False, (row["error_category"] or "")
+                if st in ("failed", "interrupted"):
+                    return False, (row["error_category"] or st)
             time.sleep(1)
         logger.warning(f"run {run_id} 等了 {timeout}s 没结束，超时放弃")
         return False, ""

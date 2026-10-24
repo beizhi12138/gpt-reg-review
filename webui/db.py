@@ -2134,6 +2134,32 @@ def finish_run(run_id: str, status: str, error: str = "", category: str = "") ->
         con.commit()
 
 
+def fail_unfinished_run(run_id: str, reason: str) -> bool:
+    """Finalize only the exiting worker's unfinished run; never infer death from age."""
+    with _lock, closing(_conn()) as con, con:
+        ended_at = time.time()
+        error = (reason or "注册线程异常退出")[:500]
+        changed = con.execute(
+            "UPDATE runs SET status='failed', finished_at=?, error=?, "
+            "error_category='worker_crash' WHERE run_id=? AND status='running'",
+            (ended_at, error, run_id),
+        ).rowcount
+        if not changed:
+            return False
+        # A retry may have reclaimed the mailbox after the original worker released it.
+        # Do not overwrite that new owner's state, or a completed mailbox/credential.
+        con.execute(
+            "UPDATE outlook_accounts SET status='failed', finished_at=?, fail_reason=? "
+            "WHERE email=(SELECT email FROM runs WHERE run_id=?) AND status='in_use' "
+            "AND NOT EXISTS (SELECT 1 FROM runs WHERE email=outlook_accounts.email "
+            "AND run_id<>? AND status IN ('running','queued','pending')) "
+            "AND (claimed_at IS NULL OR claimed_at <= "
+            "(SELECT started_at FROM runs WHERE run_id=?))",
+            (ended_at, '[worker_crash] ' + error, run_id, run_id, run_id),
+        )
+        return True
+
+
 def list_runs(limit: int = 50) -> list[dict]:
     limit = max(1, min(int(limit or 50), 1000))
     con = _conn()

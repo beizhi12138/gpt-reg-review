@@ -74,7 +74,7 @@ def config() -> dict:
         "api_key": _setting("remail_api_key", DEFAULT_API_KEY),
         "project_id": project_id,
         "email_suffix": _setting("remail_email_suffix", DEFAULT_SUFFIX),
-        "auto_buy": _flag("remail_auto_buy", True),
+        "auto_buy": _flag("remail_auto_buy", False),
         "batch_size": max(MIN_ORDER_QUANTITY, min(MAX_ORDER_QUANTITY, batch_size)),
         "min_available": max(0, min(1000, min_available)),
         "service_mode": _setting("remail_service_mode", "purchase") or "purchase",
@@ -307,81 +307,86 @@ def buy(quantity: Optional[int] = None) -> list[dict]:
 def refill(quantity: Optional[int] = None, *, reason: str = "", force: bool = False) -> dict:
     """补货：先免费导入已购 active 订单，不够再下单买新的。
 
+    自动下单关闭时不访问供号接口；force 只跳过阈值和冷却，不绕过开关。
     force=False 时只在号池可用数低于阈值（min_available）才动手；
     并发调用由 _refill_lock 串行化，避免 20 个 worker 同时下单。
     """
     global _last_refill_at
-    cfg = config()
-    if not cfg["api_key"]:
-        return {"ok": False, "error": "没有配置 ReMail API Key"}
     with _refill_lock:
+        # 等锁期间可能关闭开关，必须拿到锁后再读，避免排队请求继续联网。
+        cfg = config()
         available = int(db.stats().get("available") or 0)
+        if not cfg["auto_buy"]:
+            return {"ok": True, "skipped": True, "reason": "自动下单已关闭", "available": available}
+        if not cfg["api_key"]:
+            return {"ok": False, "error": "没有配置 ReMail API Key"}
         if not force and available > cfg["min_available"]:
             return {"ok": True, "skipped": True, "available": available}
         if not force and time.time() - _last_refill_at < 30:
             return {"ok": True, "skipped": True, "reason": "冷却中", "available": available}
 
-        imported = import_active_orders()
-        available = int(db.stats().get("available") or 0)
-        if available > cfg["min_available"]:
+        try:
+            return _refill_orders(quantity, cfg, reason)
+        finally:
+            # 401 / 超时等失败也冷却，防止所有 worker 依次重试同一个失败请求。
             _last_refill_at = time.time()
-            return {
-                "ok": True,
-                "bought": 0,
-                "imported": imported.get("inserted", 0) + imported.get("updated", 0),
-                "available": available,
-                "source": "existing_orders",
-            }
-        if not cfg["auto_buy"]:
-            return {
-                "ok": False,
-                "error": "自动下单已关闭，且已购订单不足",
-                "available": available,
-                "imported": imported.get("inserted", 0),
-            }
 
-        orders = buy(quantity)
-        rows = [row for row in (order_to_row(order) for order in orders) if row]
-        if orders and not rows:
-            # 花了钱却没有任何可取件凭证：立刻停下并进冷却，绝不再买第二批
-            # （历史事故：批量响应包装没拆，连买两批 2400 全部没入库）。
-            _last_refill_at = time.time()
-            logger.error(
-                "[mail_supply] 下单 %s 个但凭证据解析为 0（未入库），进入冷却避免重复扣费",
-                len(orders),
-            )
-            return {
-                "ok": False,
-                "error": f"下单 {len(orders)} 个但没解析出取件凭证（未入库，已在冷却中）",
-                "bought": len(orders),
-                "imported": 0,
-                "available": available,
-                "balance": balance(),
-            }
-        result = import_rows(rows)
-        _last_refill_at = time.time()
-        available = int(db.stats().get("available") or 0)
-        logger.info(
-            "[mail_supply] 补货完成（%s）：买 %s 个、入库 %s 个，可用 %s",
-            reason or "-",
-            len(orders),
-            result.get("inserted", 0) + result.get("updated", 0),
-            available,
-        )
+
+def _refill_orders(quantity: Optional[int], cfg: dict, reason: str) -> dict:
+    imported = import_active_orders()
+    available = int(db.stats().get("available") or 0)
+    if available > cfg["min_available"]:
         return {
             "ok": True,
-            "bought": len(orders),
-            "imported": result.get("inserted", 0) + result.get("updated", 0),
+            "bought": 0,
+            "imported": imported.get("inserted", 0) + imported.get("updated", 0),
             "available": available,
-            "source": "purchased",
+            "source": "existing_orders",
+        }
+    # 查询订单期间也可能关掉自动下单，购买前再检查一次。
+    if not config()["auto_buy"]:
+        return {"ok": True, "skipped": True, "reason": "自动下单已关闭", "available": available}
+
+    orders = buy(quantity)
+    rows = [row for row in (order_to_row(order) for order in orders) if row]
+    if orders and not rows:
+        logger.error(
+            "[mail_supply] 下单 %s 个但凭证据解析为 0（未入库），进入冷却避免重复扣费",
+            len(orders),
+        )
+        return {
+            "ok": False,
+            "error": f"下单 {len(orders)} 个但没解析出取件凭证（未入库，已在冷却中）",
+            "bought": len(orders),
+            "imported": 0,
+            "available": available,
             "balance": balance(),
         }
+    result = import_rows(rows)
+    available = int(db.stats().get("available") or 0)
+    logger.info(
+        "[mail_supply] 补货完成（%s）：买 %s 个、入库 %s 个，可用 %s",
+        reason or "-",
+        len(orders),
+        result.get("inserted", 0) + result.get("updated", 0),
+        available,
+    )
+    return {
+        "ok": True,
+        "bought": len(orders),
+        "imported": result.get("inserted", 0) + result.get("updated", 0),
+        "available": available,
+        "source": "purchased",
+        "balance": balance(),
+    }
 
 
 def status() -> dict:
     """给 WebUI 用的状态：配置 + 余额 + 已购订单 + 当前可用号。"""
     cfg = config()
     out: dict = {"config": cfg, "available": int(db.stats().get("available") or 0)}
+    if not cfg["auto_buy"]:
+        return out
     try:
         info = profile()
         out["balance"] = info.get("balance")

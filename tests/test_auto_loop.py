@@ -176,3 +176,47 @@ def test_idle_patience_is_longer_when_auto_supply_enabled():
     assert auto_loop._idle_patience_rounds() == 40
     db.set_setting("remail_auto_buy", "0")
     assert auto_loop._idle_patience_rounds() == 10
+
+
+def test_empty_pool_exits_without_refill_when_auto_supply_disabled(monkeypatch):
+    from unittest.mock import Mock
+    from webui import mail_supply
+
+    db.set_setting("mail_source", "icloud_relay")
+    db.set_setting("remail_auto_buy", "0")
+    refill = Mock(side_effect=AssertionError("disabled worker must not refill"))
+    sleep = Mock(side_effect=AssertionError("empty worker must not wait for new mailboxes"))
+    monkeypatch.setattr(mail_supply, "refill", refill)
+    monkeypatch.setattr(auto_loop.time, "sleep", sleep)
+    controller = auto_loop.AutoLoopController()
+    controller._worker_loop(0)
+    refill.assert_not_called()
+    sleep.assert_not_called()
+
+
+def test_natural_completion_stops_background_proxy_recovery(monkeypatch):
+    from unittest.mock import Mock
+
+    class InlineThread:
+        def __init__(self, *, target, args, **kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+        def join(self):
+            pass
+
+    db.set_setting("mail_source", "icloud_relay")
+    monkeypatch.setattr(auto_loop.threading, "Thread", InlineThread)
+    monkeypatch.setattr(auto_loop.time, "sleep", lambda delay: None)
+    controller = auto_loop.AutoLoopController()
+    controller._state = auto_loop.AutoLoopState.RUNNING
+    controller._manage_loop()
+    assert controller.status()["state"] == "stopped"
+    assert controller._stop_event.is_set()
+    probe = Mock(side_effect=AssertionError("finished batch must not probe proxies"))
+    monkeypatch.setattr(controller, "_proxy_health_check", probe)
+    controller._auto_recovery_loop()
+    probe.assert_not_called()
