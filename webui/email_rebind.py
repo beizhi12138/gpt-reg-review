@@ -328,7 +328,7 @@ def rebind_registered_email(
     target_email: str = "",
     *,
     proxy: str = "",
-    otp_timeout: int = 180,
+    otp_timeout: int = 90,
     phase_callback: Any = None,
     target_kind: str = "cf_temp",
 ) -> dict:
@@ -336,7 +336,7 @@ def rebind_registered_email(
     source_email = _clean_email(source_email, "源邮箱")
     target_email = (target_email or "").strip().lower()
     proxy = (proxy or "").strip()
-    otp_timeout = max(60, min(int(otp_timeout or 180), 600))
+    otp_timeout = max(60, min(int(otp_timeout or 90), 600))
     target_kind = (target_kind or "cf_temp").strip().lower()
     if target_kind not in {"cf_temp", "mail_com"}:
         raise EmailRebindError(f"不支持的目标邮箱来源: {target_kind}")

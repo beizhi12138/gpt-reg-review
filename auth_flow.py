@@ -745,6 +745,13 @@ class AuthFlow:
         v = getattr(self, "_env_overrides", {}).get(name)
         return os.getenv(name, default) if v is None else str(v)
 
+    def _email_otp_timeout(self) -> int:
+        """邮箱 OTP 默认每轮等 90 秒，允许调用方覆盖，不影响手机短信。"""
+        try:
+            return max(60, int(self._get_env("OTP_TIMEOUT", "90")))
+        except (TypeError, ValueError):
+            return 90
+
     def _env_flag(self, name: str, default: str = "0") -> bool:
         # 原本是 @staticmethod，为了读 self._env_overrides 改成实例方法。
         # 调用点全是 self._env_flag(...)，签名不变。
@@ -1198,10 +1205,7 @@ class AuthFlow:
             if mail_provider is None:
                 logger.warning("Codex 登录推进需要 OTP，但未提供 mail_provider")
                 return continue_url or ""
-            try:
-                otp_timeout = max(180, int(self._get_env("OTP_TIMEOUT", "180")))
-            except Exception:
-                otp_timeout = 180
+            otp_timeout = self._email_otp_timeout()
             otp_sent_at = time.time()
             if not self.kickoff_otp_delivery("codex_login_need_otp"):
                 self.send_otp()
@@ -3575,7 +3579,7 @@ class AuthFlow:
                         self.kickoff_otp_delivery("chain_email_verification")
                         otp_code = mail_provider.wait_for_otp(
                             email_addr,
-                            timeout=180,
+                            timeout=self._email_otp_timeout(),
                             issued_after=sent_at,
                         )
                         otp_resp = self.verify_otp(otp_code)
@@ -3789,7 +3793,7 @@ class AuthFlow:
                             self.kickoff_otp_delivery("existing_reauth")
                             otp_code = mail_provider.wait_for_otp(
                                 email,
-                                timeout=180,
+                                timeout=self._email_otp_timeout(),
                                 issued_after=sent_at,
                             )
                             otp_resp = self.verify_otp(otp_code)
@@ -4314,10 +4318,7 @@ class AuthFlow:
             else:
                 raise PasswordRequiredError("密码设置未获服务端确认，本次注册已停止")
 
-            try:
-                otp_timeout = max(180, int(self._get_env("OTP_TIMEOUT", "180")))
-            except Exception:
-                otp_timeout = 180
+            otp_timeout = self._email_otp_timeout()
             try:
                 otp_code = mail_provider.wait_for_otp(
                     email,
@@ -4380,10 +4381,7 @@ class AuthFlow:
             page_type = (self._existing_page_type or "").lower()
             continue_url = ""
 
-            try:
-                otp_timeout = max(180, int(self._get_env("OTP_TIMEOUT", "180")))
-            except Exception:
-                otp_timeout = 180
+            otp_timeout = self._email_otp_timeout()
 
             if page_type == "login_password":
                 logger.info("已有账号进入 login_password 分支，先走密码校验再 OTP")
@@ -4738,10 +4736,7 @@ class AuthFlow:
         sentinel = self.get_sentinel_token(device_id)
 
         continue_url = ""
-        try:
-            otp_timeout = max(180, int(self._get_env("OTP_TIMEOUT", "180")))
-        except Exception:
-            otp_timeout = 180
+        otp_timeout = self._email_otp_timeout()
 
         page_type = ""
         mode = ""

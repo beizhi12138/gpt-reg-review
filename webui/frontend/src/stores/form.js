@@ -7,7 +7,8 @@ const KEY = 'gpt_outlook_register_form_v2'
 // （proxy 在 注册 / 自动跑号 / Plus 检测 三处共用）
 const defaults = {
   proxy: '',
-  otpTimeout: 180,
+  otpTimeout: 90,
+  otpTimeoutVersion: 1,
   autoConcurrency: 1,
   autoCoolDown: 3,
   autoTargetCount: 0,
@@ -36,6 +37,11 @@ export function proxyText(form) {
 export const useFormStore = defineStore('form', () => {
   let saved = {}
   try { saved = JSON.parse(localStorage.getItem(KEY) || '{}') } catch (_) { saved = {} }
+  // 迁移旧默认值一次；之后用户主动调整的等待时间仍正常保留。
+  if (saved?.otpTimeoutVersion !== defaults.otpTimeoutVersion) {
+    if (Number(saved?.otpTimeout) === 180) saved.otpTimeout = defaults.otpTimeout
+    saved = { ...saved, otpTimeoutVersion: defaults.otpTimeoutVersion }
+  }
   const form = reactive({ ...defaults, ...saved })
 
   // clearable 清空后 proxy 会变成 undefined 并被持久化进 localStorage，
@@ -46,7 +52,7 @@ export const useFormStore = defineStore('form', () => {
 
   watch(form, (v) => {
     try { localStorage.setItem(KEY, JSON.stringify(v)) } catch (_) {}
-  }, { deep: true })
+  }, { deep: true, immediate: true })
 
   return { form }
 })

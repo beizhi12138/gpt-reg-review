@@ -177,7 +177,7 @@ async function doCheckAt() {
       const r = await checkRegisteredAt({
         emails: batch,
         proxy: proxyText(form.value),
-        otp_timeout: Math.max(60, Math.min(600, Number(form.value.otpTimeout) || 180)),
+        otp_timeout: Math.max(60, Math.min(600, Number(form.value.otpTimeout) || 90)),
         refresh_expired: true,
       })
       checked += r.checked || 0

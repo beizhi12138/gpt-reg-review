@@ -342,10 +342,7 @@ def bind_totp_2fa(
             if mail_provider is None:
                 logger.warning("[2fa] 该号需邮件 OTP，但未提供 mail_provider，跳过绑定")
                 return None
-            try:
-                otp_timeout = max(180, int(flow._get_env("OTP_TIMEOUT", "180")))
-            except Exception:
-                otp_timeout = 180
+            otp_timeout = flow._email_otp_timeout()
             logger.info("[2fa] 7.5/11 需要邮件 OTP（timeout=%ss）...", otp_timeout)
 
             # ── 先瞄一眼：码很可能【已经在信箱里了】────────────────────

@@ -93,7 +93,7 @@ async function start() {
       proxy: proxyText(form.value),
       proxy_pool: proxyStore.text,
       concurrency: parseInt(form.value.autoConcurrency, 10) || 1,
-      otp_timeout: Math.max(180, parseInt(form.value.otpTimeout, 10) || 180),
+      otp_timeout: Math.max(60, parseInt(form.value.otpTimeout, 10) || 90),
       want_access_token: true,
       want_session_token: true,
       want_refresh_token: form.value.wantRefreshToken,
@@ -142,7 +142,7 @@ async function call(fn, name) {
           <el-input-number v-model="form.autoTargetCount" :min="0" :max="100000" />
         </el-form-item>
         <el-form-item label="OTP 等待(秒)" style="margin: 0">
-          <el-input-number v-model="form.otpTimeout" :min="180" :max="600" />
+          <el-input-number v-model="form.otpTimeout" :min="60" :max="600" />
         </el-form-item>
       </el-space>
 
