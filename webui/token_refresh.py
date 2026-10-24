@@ -28,7 +28,7 @@ def _family_country() -> tuple[str, str]:
     return country, family
 
 
-def refresh_one(email: str, *, proxy: str = "", otp_timeout: int = 90) -> dict:
+def refresh_one(email: str, *, proxy: str = "", otp_timeout: int = 180) -> dict:
     """对单个已注册邮箱执行一次协议重登，成功则就地刷新凭证。"""
     email = (email or "").strip().lower()
     cred = db.get_registered(email)
@@ -106,7 +106,7 @@ def refresh_many(
     emails,
     *,
     proxy: str = "",
-    otp_timeout: int = 90,
+    otp_timeout: int = 180,
     limit: int = 20,
 ) -> dict:
     """按顺序重登一批邮箱（顺序执行，避免并发登录触发风控）。"""

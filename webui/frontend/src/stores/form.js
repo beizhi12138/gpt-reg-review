@@ -7,8 +7,8 @@ const KEY = 'gpt_outlook_register_form_v2'
 // （proxy 在 注册 / 自动跑号 / Plus 检测 三处共用）
 const defaults = {
   proxy: '',
-  otpTimeout: 90,
-  otpTimeoutVersion: 1,
+  otpTimeout: 180,
+  otpTimeoutVersion: 2,
   autoConcurrency: 1,
   autoCoolDown: 3,
   autoTargetCount: 0,
@@ -39,7 +39,7 @@ export const useFormStore = defineStore('form', () => {
   try { saved = JSON.parse(localStorage.getItem(KEY) || '{}') } catch (_) { saved = {} }
   // 迁移旧默认值一次；之后用户主动调整的等待时间仍正常保留。
   if (saved?.otpTimeoutVersion !== defaults.otpTimeoutVersion) {
-    if (Number(saved?.otpTimeout) === 180) saved.otpTimeout = defaults.otpTimeout
+    if (Number(saved?.otpTimeout) === 90) saved.otpTimeout = defaults.otpTimeout
     saved = { ...saved, otpTimeoutVersion: defaults.otpTimeoutVersion }
   }
   const form = reactive({ ...defaults, ...saved })

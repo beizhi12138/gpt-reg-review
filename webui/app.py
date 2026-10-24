@@ -152,7 +152,7 @@ class RegisterReq(BaseModel):
     # refresh_token is optional; keep this field for older API clients.
     want_refresh_token: bool = False
     proxy: str = ""
-    otp_timeout: int = 90
+    otp_timeout: int = 180
     allow_existing_login: bool = True
     # 注册成功后自动绑定 TOTP 2FA。前端两个页面都**默认开**（主人要求每个号都绑）。
     # 这里的 default 保持 False —— 它只在「调用方没传这个字段」时生效，是给旧前端
@@ -845,7 +845,7 @@ def api_registered_meta(emails: str = ""):
 class CheckAtReq(BaseModel):
     emails: list[str] = Field(..., min_length=1, max_length=50)
     proxy: str = ""
-    otp_timeout: int = Field(90, ge=60, le=600)
+    otp_timeout: int = Field(180, ge=60, le=600)
     refresh_expired: bool = True
 
 
@@ -925,7 +925,7 @@ def api_checkout_summary():
 class RefreshTokensReq(BaseModel):
     emails: list[str] = Field(..., min_length=1, max_length=50)
     proxy: str = ""
-    otp_timeout: int = Field(90, ge=60, le=600)
+    otp_timeout: int = Field(180, ge=60, le=600)
 
 
 @app.post("/api/registered/refresh_tokens")
@@ -1092,7 +1092,7 @@ class EmailRebindReq(BaseModel):
     source_email: str = Field(..., description="已注册的 iCloud 邮箱")
     target_email: str = Field("", description="目标域名邮箱；留空自动生成")
     proxy: str = ""
-    otp_timeout: int = Field(90, ge=60, le=600)
+    otp_timeout: int = Field(180, ge=60, le=600)
     target_kind: str = Field(
         "cf_temp",
         description="目标邮箱来源：cf_temp（CF 域名邮箱）或 mail_com（mail.com 别名）",
@@ -2053,7 +2053,7 @@ class AutoLoopStartReq(BaseModel):
     proxy: str = ""              # 单代理（concurrency=1 + 无代理池时用）
     proxy_pool: str = ""         # 多代理池（每行一个）；优先于 proxy
     concurrency: int = 1         # 并发 worker 数（1-20）
-    otp_timeout: int = 90
+    otp_timeout: int = 180
     allow_existing_login: bool = True
     cool_down_seconds: float = 3.0  # 每个 worker 跑完后冷却（防风控）
     target_count: int = 0        # 目标成功数（0=不限量，达标自动停止）

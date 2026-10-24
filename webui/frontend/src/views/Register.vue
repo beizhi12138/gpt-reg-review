@@ -38,7 +38,7 @@ async function run() {
     const r = await startRegister({
       email: regEmail.value.trim() || null,
       proxy: proxyText(form.value),
-      otp_timeout: Math.max(60, parseInt(form.value.otpTimeout, 10) || 90),
+      otp_timeout: Math.max(180, parseInt(form.value.otpTimeout, 10) || 180),
       want_access_token: true,
       want_session_token: true,
       want_refresh_token: form.value.wantRefreshToken,
@@ -100,7 +100,7 @@ async function copyField(email, field) {
               </div>
             </el-form-item>
             <el-form-item label="OTP 等待秒数">
-              <el-input-number v-model="form.otpTimeout" :min="60" :max="600" />
+              <el-input-number v-model="form.otpTimeout" :min="180" :max="600" />
             </el-form-item>
             <el-form-item>
               <div style="display: flex; align-items: center; gap: 8px">

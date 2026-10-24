@@ -8,7 +8,7 @@ import auth_flow
 
 
 @pytest.mark.parametrize("configured,expected", [
-    (None, 90), ("90", 90), ("240", 240), ("invalid", 90), ("0", 60),
+    (None, 180), ("90", 180), ("180", 180), ("240", 240), ("invalid", 180), ("0", 180),
 ])
 def test_email_wait_default_and_override(monkeypatch, configured, expected):
     monkeypatch.delenv("OTP_TIMEOUT", raising=False)
@@ -18,16 +18,16 @@ def test_email_wait_default_and_override(monkeypatch, configured, expected):
 
 
 @pytest.mark.parametrize("is_new,mode", [(True, ""), (False, "passwordless_signup")])
-def test_registration_resends_after_90_seconds_and_advances_mail_cutoff(
+def test_registration_resends_after_180_seconds_and_advances_mail_cutoff(
     monkeypatch, is_new, mode,
 ):
     # Per-task options must win over an old process-wide value.
-    monkeypatch.setenv("OTP_TIMEOUT", "180")
+    monkeypatch.setenv("OTP_TIMEOUT", "90")
     clock = [1000.0]
     monkeypatch.setattr(auth_flow.time, "time", lambda: clock[0])
     flow = auth_flow.AuthFlow.__new__(auth_flow.AuthFlow)
     flow.result = auth_flow.AuthResult()
-    flow._env_overrides = {"OTP_TIMEOUT": "90"}
+    flow._env_overrides = {"OTP_TIMEOUT": "180"}
     flow._existing_email_verification_mode = mode
     for name in ("check_proxy", "warmup", "get_csrf_token", "get_auth_url",
                  "auth_oauth_init", "get_sentinel_token", "register_password"):
@@ -63,6 +63,6 @@ def test_registration_resends_after_90_seconds_and_advances_mail_cutoff(
     with pytest.raises(Verified):
         flow.run_register(mail)
 
-    assert waits == [(90, 1000.0), (90, 1090.0)]
-    assert events == [("send", 1000.0), ("resend", 1090.0)]
+    assert waits == [(180, 1000.0), (180, 1180.0)]
+    assert events == [("send", 1000.0), ("resend", 1180.0)]
     flow.verify_otp.assert_called_once_with("654321")

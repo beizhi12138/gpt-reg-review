@@ -636,7 +636,7 @@ class BrowserAuthFlow:
           <button type="submit" name="intent" class="..._transparent_...">  ← 重发
         """
         logger.info("[browser] 等待 OTP 验证码...")
-        otp_timeout = int(self._env("OTP_TIMEOUT", "90"))
+        otp_timeout = max(180, int(self._env("OTP_TIMEOUT", "180")))
         # ⚠ issued_after 必须用邮箱提交时间（而非当前时间），否则会漏掉已到的邮件
         issued_after = getattr(self, "_email_submitted_at", time.time()) - 10
 

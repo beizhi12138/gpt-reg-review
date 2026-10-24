@@ -468,7 +468,7 @@ def _do_register(
         # auth_flow 会误判为"已有账号"分支 → 不设 WEBUI_ALLOW_LOGIN 会 fast-fail。
         # 单号 WebUI 场景下 fast-fail 没意义（批量跑才需要"跳过被识别的号"），故强制 ON。
         env_overrides["WEBUI_ALLOW_LOGIN"] = "1"
-        env_overrides["OTP_TIMEOUT"] = str(int(options.get("otp_timeout") or 90))
+        env_overrides["OTP_TIMEOUT"] = str(int(options.get("otp_timeout") or 180))
         # 人类操作节奏：关键步骤之间插随机停顿（只改时序，不改请求内容）。
         # 放在生产路径开启而不是默认开启，避免拖慢单元测试。
         env_overrides["WEBUI_HUMANIZE"] = "1"
@@ -1521,7 +1521,7 @@ def start_registration(account: dict, options: dict) -> str:
         if session_ttl:
             reserved_at = float(environment.get("session_reserved_at") or time.time())
             remaining = session_ttl - (time.time() - reserved_at)
-            needed = float(options.get("otp_timeout") or 90) + 240.0
+            needed = float(options.get("otp_timeout") or 180) + 240.0
             if remaining < needed:
                 raise EnvironmentAllocationError(
                     f"粘性会话剩余寿命不足: remaining={int(remaining)}s < "

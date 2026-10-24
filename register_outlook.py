@@ -12,7 +12,7 @@
 
 可选环境变量：
     PROXY                出口代理 URL，例如 socks5://user:pass@host:port
-    OTP_TIMEOUT          邮箱 OTP 等待秒数（默认 90，下限 60）
+    OTP_TIMEOUT          邮箱 OTP 等待秒数（默认 180，下限 180）
     WEBUI_ALLOW_LOGIN    1 = 邮箱被 OpenAI 识为已注册时走 OTP login 拿凭证
                          (默认 0：fast-fail 抛 RuntimeError，换下一个号)
     SKIP_OAUTH_TOKEN_EXCHANGE  1=跳过 OAuth refresh_token 交换

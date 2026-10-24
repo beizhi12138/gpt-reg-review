@@ -746,11 +746,11 @@ class AuthFlow:
         return os.getenv(name, default) if v is None else str(v)
 
     def _email_otp_timeout(self) -> int:
-        """邮箱 OTP 默认每轮等 90 秒，允许调用方覆盖，不影响手机短信。"""
+        """邮箱 OTP 每轮至少等 180 秒，允许调用方延长，不影响手机短信。"""
         try:
-            return max(60, int(self._get_env("OTP_TIMEOUT", "90")))
+            return max(180, int(self._get_env("OTP_TIMEOUT", "180")))
         except (TypeError, ValueError):
-            return 90
+            return 180
 
     def _env_flag(self, name: str, default: str = "0") -> bool:
         # 原本是 @staticmethod，为了读 self._env_overrides 改成实例方法。
