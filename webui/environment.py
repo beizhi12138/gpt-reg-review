@@ -1,8 +1,8 @@
 """Per-task network and browser environment allocation.
 
 The allocator freezes the network observation and the generated fingerprint before
-the registration thread starts. SQLite owns the historical uniqueness guarantees so
-concurrent workers cannot reserve the same exit IP or semantic profile.
+the registration thread starts. SQLite enforces a rolling 24-hour exit IP window
+and lifetime semantic profile uniqueness, including concurrent reservations.
 """
 from __future__ import annotations
 
@@ -499,7 +499,7 @@ def _summarize_allocation_failures(failures: list[str]) -> str:
     #    2026-09-29 踩过：把"版本自洽"改写成"版本自相矛盾"，直接让
     #    test_protocol_realism 里那条断言失败 —— 归类可以新写，术语不能乱换。
     buckets = (
-        ("已在历史台账中", "出口 IP 已在历史台账中（任务间出口需唯一）",
+        ("已在历史", "出口 IP 已在历史台账中（最近 24 小时内不可复用）",
          "扩大代理池：多加几条不同地区的端点"),
         ("已被并发任务预留", "出口 IP 已被并发任务预留",
          "降低并发，或扩大代理池"),
@@ -548,8 +548,8 @@ def allocate_environment(run_id: str, options: Mapping[str, Any]) -> dict[str, A
     任务级不变量：
     1) 任务内稳定 —— 出口 IP 与指纹在分配时冻结，preflight/中途守卫保证
        整个任务只用这一条 IP、这一套指纹；
-    2) 任务间唯一 —— exit_ip / fingerprint 在历史台账中有 UNIQUE 约束，
-       每个新任务必须拿到从未用过的出口与指纹，绝不与上一个任务相同。
+    2) 任务间去重 —— exit_ip 在最近 24 小时内唯一，过期后可复用；
+       fingerprint 仍保持全历史唯一。最终预留在数据库写事务内检查并发冲突。
     """
     family, engine, prefer_firefox = _fingerprint_policy(options)
     try:
@@ -576,7 +576,7 @@ def allocate_environment(run_id: str, options: Mapping[str, Any]) -> dict[str, A
     # firefox147 只有 4/12（CF 对 firefox 的 403 拦截率高）。串行逐条探等于
     # 把 2/3 的探测时间浪费在注定失败的候选上，吞吐掉到三分之一。
     # 这里一次并发探 N 个候选，谁先通过就用谁；台账去重与指纹冻结仍在主线程
-    # 串行完成，「探测指纹 = 任务指纹」「出口 IP/画像全历史唯一」不变。
+    # 串行完成；探测指纹 = 任务指纹，IP 按 24 小时窗口去重，画像全历史唯一。
     try:
         parallel = int(options.get("environment_probe_parallel") or 5)
     except (TypeError, ValueError):
@@ -669,7 +669,7 @@ def allocate_environment(run_id: str, options: Mapping[str, Any]) -> dict[str, A
                     continue
 
                 if db.environment_seen(exit_ip=observed["exit_ip"]):
-                    failures.append(f"出口 IP 已在历史账本中: {observed['exit_ip']}")
+                    failures.append(f"出口 IP 已在历史账本中（最近 24 小时）: {observed['exit_ip']}")
                     continue
 
                 profile_country, country_source = _requested_country(options, observed["exit_country"])
@@ -762,8 +762,8 @@ def allocate_environment(run_id: str, options: Mapping[str, Any]) -> dict[str, A
                         return environment
 
                     # A concurrent task won the reservation between the existence check
-                    # and INSERT. Generate another profile and let the unique constraints
-                    # arbitrate the race again.
+                    # and INSERT. The database transaction arbitrates IP races;
+                    # profile uniqueness is still enforced for all history.
                     if db.environment_seen(exit_ip=observed["exit_ip"]):
                         failures.append(f"出口 IP 已被并发任务预留: {observed['exit_ip']}")
                         break

@@ -85,13 +85,13 @@ def test_proxy_pool_api_roundtrip(isolated_db):
     assert "socks5h://z:z@host:2080" in got["text"]
 
 
-def test_exit_ip_never_reused_across_tasks(isolated_db):
+def test_exit_ip_not_reused_within_window(isolated_db):
     env = _make_environment(run_id="run-a", exit_ip="203.0.113.10")
     assert db.reserve_environment("run-a", env)
     db.create_run("run-a", "a@example.com", "a.log")
     db.update_run_environment("run-a", env)
 
-    # 同出口再预留必须被台账拒绝：任务之间不允许复用同一条 IP
+    # 同出口立即再预留必须被台账拒绝：24 小时内不允许复用同一条 IP。
     next_env = _make_environment(run_id="run-b", exit_ip="203.0.113.10")
     assert not db.reserve_environment("run-b", next_env)
 

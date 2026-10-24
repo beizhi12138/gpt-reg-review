@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import sqlite3
 import sys
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -34,17 +36,98 @@ DB_PATH = Path(__file__).resolve().parent / "webui.db"
 
 _lock = threading.Lock()  # SQLite 写入串行化
 
+# An exit becomes reusable exactly 24 hours after its last reservation. Keep
+# history for diagnostics; only the IP exclusion window expires, not profiles.
+EXIT_IP_REUSE_WINDOW_SECONDS = 24 * 60 * 60
+_RUN_IP_RESERVED_AT = "COALESCE(exit_ip_reserved_at, started_at, 0)"
+_LEDGER_IP_RESERVED_AT = "COALESCE(exit_ip_reserved_at, created_at, 0)"
+_QUERY_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_runs_exit_ip_reserved_at ON runs(exit_ip, "
+    + _RUN_IP_RESERVED_AT + ")",
+    "CREATE INDEX IF NOT EXISTS idx_environment_exit_ip_reserved_at "
+    "ON environment_ledger(exit_ip, " + _LEDGER_IP_RESERVED_AT + ")",
+    "CREATE INDEX IF NOT EXISTS idx_runs_fingerprint_id ON runs(fingerprint_id)",
+    "CREATE INDEX IF NOT EXISTS idx_runs_fingerprint_signature ON runs(fingerprint_signature)",
+)
+
 
 def _conn() -> sqlite3.Connection:
     con = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    return con
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL").close()
+        return con
+    except BaseException:
+        con.close()
+        raise
+
+
+def _migrate_environment_ip_window(con: sqlite3.Connection) -> None:
+    """Remove lifetime IP uniqueness without dropping history or profile guards.
+
+    SQLite cannot remove an inline UNIQUE constraint. Rebuild just this small
+    ledger in one transaction, retaining its columns, rows and other indexes.
+    The large runs table only gains a nullable timestamp (legacy rows fall back
+    to started_at), avoiding a full-history rewrite at startup.
+    """
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        unique_ip_indexes = set()
+        for index in con.execute("PRAGMA index_list(environment_ledger)").fetchall():
+            name = index[1]
+            quoted_name = '"' + name.replace('"', '""') + '"'
+            columns = [row[2] for row in con.execute(f"PRAGMA index_info({quoted_name})")]
+            if index[2] and columns == ["exit_ip"]:
+                unique_ip_indexes.add(name)
+        if unique_ip_indexes:
+            ddl = con.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='environment_ledger'"
+            ).fetchone()[0]
+            ddl = re.sub(
+                r"(\bexit_ip\s+TEXT\s+NOT\s+NULL)\s+UNIQUE\b", r"\1", ddl,
+                flags=re.IGNORECASE,
+            )
+            ddl, renamed = re.subn(
+                r'(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)["`\[]?environment_ledger["`\]]?',
+                r"\1environment_ledger_ip_window", ddl, count=1, flags=re.IGNORECASE,
+            )
+            if renamed != 1:
+                raise RuntimeError("Unrecognized environment ledger schema; migration cancelled")
+            objects = con.execute(
+                "SELECT name, sql FROM sqlite_master WHERE tbl_name='environment_ledger' "
+                "AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+            ).fetchall()
+            columns = ", ".join(
+                '"' + row[1].replace('"', '""') + '"'
+                for row in con.execute("PRAGMA table_info(environment_ledger)")
+            )
+            con.execute(ddl)
+            for index in con.execute("PRAGMA index_list(environment_ledger_ip_window)").fetchall():
+                quoted_name = '"' + index[1].replace('"', '""') + '"'
+                index_columns = [row[2] for row in con.execute(f"PRAGMA index_info({quoted_name})")]
+                if index[2] and index_columns == ["exit_ip"]:
+                    raise RuntimeError("Unrecognized IP UNIQUE constraint; migration cancelled")
+            con.execute(
+                f"INSERT INTO environment_ledger_ip_window ({columns}) "
+                f"SELECT {columns} FROM environment_ledger"
+            )
+            con.execute("DROP TABLE environment_ledger")
+            con.execute("ALTER TABLE environment_ledger_ip_window RENAME TO environment_ledger")
+            for name, sql in objects:
+                if name not in unique_ip_indexes:
+                    con.execute(sql)
+        columns = {row[1] for row in con.execute("PRAGMA table_info(environment_ledger)")}
+        if "exit_ip_reserved_at" not in columns:
+            con.execute("ALTER TABLE environment_ledger ADD COLUMN exit_ip_reserved_at REAL")
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
 
 
 def init_db():
-    con = _conn()
-    con.executescript("""
+    with closing(_conn()) as con:
+        con.executescript("""
         CREATE TABLE IF NOT EXISTS outlook_accounts (
             email           TEXT PRIMARY KEY,
             password        TEXT,
@@ -99,6 +182,7 @@ def init_db():
             proxy            TEXT,
             proxy_fingerprint TEXT,
             exit_ip          TEXT,
+            exit_ip_reserved_at REAL,
             exit_country     TEXT,
             country_code     TEXT,
             country_source   TEXT,
@@ -117,7 +201,8 @@ def init_db():
             run_id                 TEXT NOT NULL UNIQUE,
             proxy                  TEXT,
             proxy_fingerprint      TEXT NOT NULL,
-            exit_ip                TEXT NOT NULL UNIQUE,
+            exit_ip                TEXT NOT NULL,
+            exit_ip_reserved_at    REAL,
             exit_country           TEXT,
             country_code           TEXT,
             country_source         TEXT,
@@ -171,71 +256,79 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_plus_activations_activated
             ON plus_activations(activated DESC, updated_at DESC);
     """)
-    con.commit()
-    # 老 DB migrate：error_category 在后期才加，对已建表补列
-    cur = con.execute("PRAGMA table_info(runs)")
-    cols = {r[1] for r in cur.fetchall()}
-    if "error_category" not in cols:
-        con.execute("ALTER TABLE runs ADD COLUMN error_category TEXT")
+        con.commit()
+        # 老 DB migrate：error_category 在后期才加，对已建表补列
+        cur = con.execute("PRAGMA table_info(runs)")
+        cols = {r[1] for r in cur.fetchall()}
+        if "error_category" not in cols:
+            con.execute("ALTER TABLE runs ADD COLUMN error_category TEXT")
+            con.commit()
+
+        # Task environment columns were added after the original runs table. Keep
+        # this migration idempotent so existing WebUI databases gain the ledger
+        # metadata without losing their historical run rows.
+        run_migrations = {
+            "allocation_id": "TEXT",
+            "proxy": "TEXT",
+            "proxy_fingerprint": "TEXT",
+            "exit_ip": "TEXT",
+            "exit_ip_reserved_at": "REAL",
+            "exit_country": "TEXT",
+            "country_code": "TEXT",
+            "country_source": "TEXT",
+            "browser_family": "TEXT",
+            "browser_engine": "TEXT",
+            "fingerprint_id": "TEXT",
+            "fingerprint_signature": "TEXT",
+            "fingerprint_json": "TEXT",
+            "environment_json": "TEXT",
+            "runtime_observation_json": "TEXT",
+            "probe_json": "TEXT",
+            # 流量计数（2026-09-26 加）：本次任务通过 HTTP 会话收发的字节数。
+            # 由 registrar 在任务收尾时写入，注册结果页用来显示「用了多少流量」。
+            "traffic_rx": "INTEGER",
+            "traffic_tx": "INTEGER",
+        }
+        for name, sql_type in run_migrations.items():
+            if name not in cols:
+                con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
         con.commit()
 
-    # Task environment columns were added after the original runs table. Keep
-    # this migration idempotent so existing WebUI databases gain the ledger
-    # metadata without losing their historical run rows.
-    run_migrations = {
-        "allocation_id": "TEXT",
-        "proxy": "TEXT",
-        "proxy_fingerprint": "TEXT",
-        "exit_ip": "TEXT",
-        "exit_country": "TEXT",
-        "country_code": "TEXT",
-        "country_source": "TEXT",
-        "browser_family": "TEXT",
-        "browser_engine": "TEXT",
-        "fingerprint_id": "TEXT",
-        "fingerprint_signature": "TEXT",
-        "fingerprint_json": "TEXT",
-        "environment_json": "TEXT",
-        "runtime_observation_json": "TEXT",
-        "probe_json": "TEXT",
-        # 流量计数（2026-09-26 加）：本次任务通过 HTTP 会话收发的字节数。
-        # 由 registrar 在任务收尾时写入，注册结果页用来显示「用了多少流量」。
-        "traffic_rx": "INTEGER",
-        "traffic_tx": "INTEGER",
-    }
-    for name, sql_type in run_migrations.items():
-        if name not in cols:
-            con.execute(f"ALTER TABLE runs ADD COLUMN {name} {sql_type}")
-    con.commit()
-
-    # 老 DB migrate：号池多邮箱混放（kind / relay_url 在后期才加）
-    # 存量行全部是 outlook 时代导进去的，DEFAULT 'outlook' 正好把它们
-    # 归位，不需要额外 UPDATE。重复执行无副作用。
-    cur = con.execute("PRAGMA table_info(outlook_accounts)")
-    acc_cols = {r[1] for r in cur.fetchall()}
-    if "kind" not in acc_cols:
+        # 老 DB migrate：号池多邮箱混放（kind / relay_url 在后期才加）
+        # 存量行全部是 outlook 时代导进去的，DEFAULT 'outlook' 正好把它们
+        # 归位，不需要额外 UPDATE。重复执行无副作用。
+        cur = con.execute("PRAGMA table_info(outlook_accounts)")
+        acc_cols = {r[1] for r in cur.fetchall()}
+        if "kind" not in acc_cols:
+            con.execute(
+                "ALTER TABLE outlook_accounts ADD COLUMN kind TEXT NOT NULL DEFAULT 'outlook'"
+            )
+            con.commit()
+        if "relay_url" not in acc_cols:
+            con.execute("ALTER TABLE outlook_accounts ADD COLUMN relay_url TEXT")
+            con.commit()
+        # 索引建在补列之后，否则老库上 CREATE INDEX 会因为没有 kind 列而失败
         con.execute(
-            "ALTER TABLE outlook_accounts ADD COLUMN kind TEXT NOT NULL DEFAULT 'outlook'"
+            "CREATE INDEX IF NOT EXISTS idx_outlook_kind ON outlook_accounts(kind, status)"
         )
         con.commit()
-    if "relay_url" not in acc_cols:
-        con.execute("ALTER TABLE outlook_accounts ADD COLUMN relay_url TEXT")
-        con.commit()
-    # 索引建在补列之后，否则老库上 CREATE INDEX 会因为没有 kind 列而失败
-    con.execute(
-        "CREATE INDEX IF NOT EXISTS idx_outlook_kind ON outlook_accounts(kind, status)"
-    )
-    con.commit()
 
-    # 老 DB migrate：registered 的 2FA 两列（totp_secret / totp_factor_id）后期才加。
-    # secret 一次性下发、服务端取不回，务必单独补列持久化。重复执行无副作用。
-    cur = con.execute("PRAGMA table_info(registered)")
-    reg_cols = {r[1] for r in cur.fetchall()}
-    if "totp_secret" not in reg_cols:
-        con.execute("ALTER TABLE registered ADD COLUMN totp_secret TEXT")
-        con.commit()
-    if "totp_factor_id" not in reg_cols:
-        con.execute("ALTER TABLE registered ADD COLUMN totp_factor_id TEXT")
+        # 老 DB migrate：registered 的 2FA 两列（totp_secret / totp_factor_id）后期才加。
+        # secret 一次性下发、服务端取不回，务必单独补列持久化。重复执行无副作用。
+        cur = con.execute("PRAGMA table_info(registered)")
+        reg_cols = {r[1] for r in cur.fetchall()}
+        if "totp_secret" not in reg_cols:
+            con.execute("ALTER TABLE registered ADD COLUMN totp_secret TEXT")
+            con.commit()
+        if "totp_factor_id" not in reg_cols:
+            con.execute("ALTER TABLE registered ADD COLUMN totp_factor_id TEXT")
+            con.commit()
+
+        # These indexes reference columns introduced by the migrations above.
+        # Run only after those columns exist, and leave historical rows intact.
+        _migrate_environment_ip_window(con)
+        for statement in _QUERY_INDEX_STATEMENTS:
+            con.execute(statement)
         con.commit()
 
 
@@ -1650,23 +1743,30 @@ def _environment_values(environment: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def environment_seen(
+def _environment_seen(
+    con: sqlite3.Connection,
     *,
     exit_ip: str = "",
     fingerprint_id: str = "",
     fingerprint_signature: str = "",
+    now: float | None = None,
 ) -> bool:
-    """Return whether a value has already been reserved in historical records.
-
-    Unique-ness is enforced against both the environment ledger and historical
-    run rows: a task that frees its ledger entry (manual cleanup / pool switch)
-    must still never reuse an exit IP or fingerprint that any earlier run
-    already touched.
-    """
+    """Check IPs within 24 hours, and profiles against all retained history."""
+    exit_ip = str(exit_ip or "").strip()
+    if exit_ip:
+        cutoff = (time.time() if now is None else now) - EXIT_IP_REUSE_WINDOW_SECONDS
+        for table, timestamp in (
+            ("environment_ledger", _LEDGER_IP_RESERVED_AT),
+            ("runs", _RUN_IP_RESERVED_AT),
+        ):
+            if con.execute(
+                f"SELECT 1 FROM {table} WHERE exit_ip=? AND {timestamp}>? LIMIT 1",
+                (exit_ip, cutoff),
+            ).fetchone() is not None:
+                return True
     checks: list[str] = []
     values: list[str] = []
     for column, value in (
-        ("exit_ip", exit_ip),
         ("fingerprint_id", fingerprint_id),
         ("fingerprint_signature", fingerprint_signature),
     ):
@@ -1676,15 +1776,31 @@ def environment_seen(
             values.append(value)
     if not checks:
         return False
-    con = _conn()
     for table in ("environment_ledger", "runs"):
-        row = con.execute(
-            f"SELECT 1 FROM {table} WHERE {' OR '.join(checks)} LIMIT 1",
-            values,
-        ).fetchone()
-        if row is not None:
+        if con.execute(
+            f"SELECT 1 FROM {table} WHERE {' OR '.join(checks)} LIMIT 1", values,
+        ).fetchone() is not None:
             return True
     return False
+
+
+def environment_seen(
+    *,
+    exit_ip: str = "",
+    fingerprint_id: str = "",
+    fingerprint_signature: str = "",
+) -> bool:
+    """An IP is occupied for 24 hours; fingerprints remain lifetime-unique.
+
+    Both ledger and run records participate, including legacy runs whose
+    ledger was cleared. Expired IP records are retained but no longer exclude
+    a candidate. Re-reserving an expired IP starts a fresh 24-hour window.
+    """
+    with closing(_conn()) as con:
+        return _environment_seen(
+            con, exit_ip=exit_ip, fingerprint_id=fingerprint_id,
+            fingerprint_signature=fingerprint_signature,
+        )
 
 
 def reserve_environment(run_id: str, environment: Mapping[str, Any]) -> bool:
@@ -1694,17 +1810,67 @@ def reserve_environment(run_id: str, environment: Mapping[str, Any]) -> bool:
     if not values["exit_ip"] or not values["fingerprint_id"] or not values["fingerprint_signature"]:
         raise ValueError("environment reservation requires exit_ip, fingerprint_id and fingerprint_signature")
     with _lock:
-        con = _conn()
-        try:
+        with closing(_conn()) as con:
+            try:
+                # A Python lock alone does not cover other worker processes.
+                # Hold SQLite's writer lock across the window check and insert.
+                con.execute("BEGIN IMMEDIATE")
+                now = time.time()
+                if _environment_seen(
+                    con, exit_ip=values["exit_ip"], fingerprint_id=values["fingerprint_id"],
+                    fingerprint_signature=values["fingerprint_signature"], now=now,
+                ):
+                    con.rollback()
+                    return False
+                con.execute(
+                    "INSERT INTO environment_ledger "
+                    "(allocation_id, run_id, proxy, proxy_fingerprint, exit_ip, exit_country, "
+                    "country_code, country_source, browser_family, browser_engine, fingerprint_id, "
+                    "fingerprint_signature, fingerprint_json, created_at, exit_ip_reserved_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        values["allocation_id"],
+                        values["run_id"],
+                        values["proxy"],
+                        values["proxy_fingerprint"],
+                        values["exit_ip"],
+                        values["exit_country"],
+                        values["country_code"],
+                        values["country_source"],
+                        values["browser_family"],
+                        values["browser_engine"],
+                        values["fingerprint_id"],
+                        values["fingerprint_signature"],
+                        values["fingerprint_json"],
+                        now,
+                        now,
+                    ),
+                )
+                con.commit()
+                return True
+            except sqlite3.IntegrityError:
+                con.rollback()
+                return False
+
+
+def update_run_environment(run_id: str, environment: Mapping[str, Any]) -> None:
+    """Persist the frozen expected environment on its run row."""
+    values = _environment_values(environment)
+    with _lock:
+        with closing(_conn()) as con:
+            reserved = con.execute(
+                f"SELECT {_LEDGER_IP_RESERVED_AT} FROM environment_ledger "
+                "WHERE run_id=? AND exit_ip=?",
+                (run_id, values["exit_ip"]),
+            ).fetchone()
+            reserved_at = reserved[0] if reserved is not None else time.time()
             con.execute(
-                "INSERT INTO environment_ledger "
-                "(allocation_id, run_id, proxy, proxy_fingerprint, exit_ip, exit_country, "
-                "country_code, country_source, browser_family, browser_engine, fingerprint_id, "
-                "fingerprint_signature, fingerprint_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "UPDATE runs SET allocation_id=?, proxy=?, proxy_fingerprint=?, exit_ip=?, "
+                "exit_country=?, country_code=?, country_source=?, browser_family=?, "
+                "browser_engine=?, fingerprint_id=?, fingerprint_signature=?, fingerprint_json=?, "
+                "environment_json=?, exit_ip_reserved_at=? WHERE run_id=?",
                 (
                     values["allocation_id"],
-                    values["run_id"],
                     values["proxy"],
                     values["proxy_fingerprint"],
                     values["exit_ip"],
@@ -1716,44 +1882,12 @@ def reserve_environment(run_id: str, environment: Mapping[str, Any]) -> bool:
                     values["fingerprint_id"],
                     values["fingerprint_signature"],
                     values["fingerprint_json"],
-                    time.time(),
+                    values["environment_json"],
+                    reserved_at,
+                    run_id,
                 ),
             )
             con.commit()
-            return True
-        except sqlite3.IntegrityError:
-            con.rollback()
-            return False
-
-
-def update_run_environment(run_id: str, environment: Mapping[str, Any]) -> None:
-    """Persist the frozen expected environment on its run row."""
-    values = _environment_values(environment)
-    with _lock:
-        con = _conn()
-        con.execute(
-            "UPDATE runs SET allocation_id=?, proxy=?, proxy_fingerprint=?, exit_ip=?, "
-            "exit_country=?, country_code=?, country_source=?, browser_family=?, "
-            "browser_engine=?, fingerprint_id=?, fingerprint_signature=?, fingerprint_json=?, "
-            "environment_json=? WHERE run_id=?",
-            (
-                values["allocation_id"],
-                values["proxy"],
-                values["proxy_fingerprint"],
-                values["exit_ip"],
-                values["exit_country"],
-                values["country_code"],
-                values["country_source"],
-                values["browser_family"],
-                values["browser_engine"],
-                values["fingerprint_id"],
-                values["fingerprint_signature"],
-                values["fingerprint_json"],
-                values["environment_json"],
-                run_id,
-            ),
-        )
-        con.commit()
 
 
 def rebind_environment_exit(
@@ -1768,7 +1902,7 @@ def rebind_environment_exit(
     （20 并发启动那一波实测丢了 3 个任务）。
 
     两条不变量继续守住：
-      - 任务间唯一：B 若已在台账/历史任务里出现过，直接返回 False（调用方照旧中止）；
+      - 24 小时内唯一：B 若在最近 24 小时已被使用，返回 False（调用方照旧中止）；
       - 任务内唯一：改绑之后任务只用 B。A 从未对 OpenAI 用过，释放它不会污染任何人。
     """
     values = _environment_values(environment)
@@ -1776,31 +1910,37 @@ def rebind_environment_exit(
     old_ip = str(old_exit_ip or "").strip()
     if not run_id or not new_ip or not old_ip or new_ip == old_ip:
         return False
-    # 唯一性先查一遍，把常见情况挡在事务外；并发竞争由下面的 UNIQUE 约束兜底。
+    # Quick rejection outside the transaction; the check must also be repeated
+    # under SQLite's writer lock now that old IP rows may coexist in the ledger.
     if environment_seen(exit_ip=new_ip):
         return False
     with _lock:
-        con = _conn()
-        try:
-            cur = con.execute(
-                "UPDATE environment_ledger SET exit_ip=?, exit_country=? "
-                "WHERE run_id=? AND exit_ip=?",
-                (new_ip, values["exit_country"], run_id, old_ip),
-            )
-            if cur.rowcount != 1:
-                # 台账里没有这一行（run_id/旧 IP 对不上）→ 不敢改，按原逻辑中止。
+        with closing(_conn()) as con:
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                now = time.time()
+                if _environment_seen(con, exit_ip=new_ip, now=now):
+                    con.rollback()
+                    return False
+                cur = con.execute(
+                    "UPDATE environment_ledger SET exit_ip=?, exit_country=?, exit_ip_reserved_at=? "
+                    "WHERE run_id=? AND exit_ip=?",
+                    (new_ip, values["exit_country"], now, run_id, old_ip),
+                )
+                if cur.rowcount != 1:
+                    # 台账里没有这一行（run_id/旧 IP 对不上）→ 不敢改，按原逻辑中止。
+                    con.rollback()
+                    return False
+                con.execute(
+                    "UPDATE runs SET exit_ip=?, exit_country=?, environment_json=?, exit_ip_reserved_at=? "
+                    "WHERE run_id=? AND exit_ip=?",
+                    (new_ip, values["exit_country"], values["environment_json"], now, run_id, old_ip),
+                )
+                con.commit()
+                return True
+            except sqlite3.IntegrityError:
                 con.rollback()
                 return False
-            con.execute(
-                "UPDATE runs SET exit_ip=?, exit_country=?, environment_json=? "
-                "WHERE run_id=? AND exit_ip=?",
-                (new_ip, values["exit_country"], values["environment_json"], run_id, old_ip),
-            )
-            con.commit()
-            return True
-        except sqlite3.IntegrityError:
-            con.rollback()
-            return False
 
 
 def get_run_environment(run_id: str) -> dict:
